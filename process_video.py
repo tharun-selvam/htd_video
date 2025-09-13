@@ -19,6 +19,9 @@ from torchvision.models.optical_flow import raft_small, Raft_Small_Weights
 from torchvision.utils import flow_to_image
 from _htd_tree import process_scene_with_tree
 
+# --- GLOBAL CONTROLLER: Choose your flow algorithm ---
+# Options: "RAFT" or "FARNEBACK"
+FLOW_METHOD = "RAFT"
 SMALL_RAFT = 1
 BIG_RAFT = 2
 
@@ -80,6 +83,55 @@ def find_scenes(video_path, threshold=27.0):
     print(f"[INFO] Detected {len(scene_list)} scenes.")
     video_manager.release()
     return scene_list
+
+
+def calculate_flow_farneback(leaf_frames, scene_index=0):
+    """
+    Calculates DENSE optical flow for all frame pairs using the CPU-based
+    Farneback algorithm. This is much faster than RAFT and uses no VRAM.
+    
+    It outputs a single tensor on the CPU, matching the output format
+    of the calculate_flow_batched function.
+    """
+    
+    num_pairs = len(leaf_frames) - 1
+    print(f"  -> Processing {num_pairs} frame pairs using Farneback (CPU)...")
+
+    if num_pairs < 1:
+        return None
+
+    # We need a grayscale version of the first frame to start
+    try:
+        prev_gray = cv2.cvtColor(leaf_frames[0]['frame_data'], cv2.COLOR_BGR2GRAY)
+    except cv2.error as e:
+        print(f"    [ERROR] Failed to convert frame to grayscale. Skipping scene. Error: {e}")
+        return None
+    
+    all_flow_tensors = []
+    
+    # Loop from the second frame onwards
+    for i in range(1, len(leaf_frames)):
+        # Get the current frame in grayscale
+        curr_gray = cv2.cvtColor(leaf_frames[i]['frame_data'], cv2.COLOR_BGR2GRAY)
+        
+        # --- Calculate Optical Flow ---
+        # This is the core Farneback function. It outputs a NumPy array [H, W, 2]
+        flow_numpy = cv2.calcOpticalFlowFarneback(
+            prev_gray, curr_gray, None, 
+            0.5, 3, 15, 3, 5, 1.2, 0)
+        
+        # Convert the [H, W, 2] NumPy array to a [2, H, W] PyTorch tensor (on CPU)
+        flow_tensor = torch.from_numpy(flow_numpy).permute(2, 0, 1)
+        all_flow_tensors.append(flow_tensor)
+        
+        # Set the current frame as the "previous" frame for the next iteration
+        prev_gray = curr_gray
+
+    if not all_flow_tensors:
+        return None
+        
+    # Stack all [2, H, W] CPU tensors into a single [N-1, 2, H, W] CPU tensor
+    return torch.stack(all_flow_tensors, dim=0)
 
 
 def calculate_flow_batched(scene_frames, model, transforms, device, scene_index, batch_size=4):
@@ -715,11 +767,16 @@ def process_leaf_node_flows(leaf_node, video_path, raft_model, raft_transforms, 
     if device == "cuda":
         torch.cuda.empty_cache()
 
-    # Calculate optical flow for this leaf node only
-    scene_flow_tensor = calculate_flow_batched(
-        leaf_frames, raft_model, raft_transforms, device,
-        scene_index=0, batch_size=4  # Smaller batch size for memory efficiency
-    )
+    scene_flow_tensor = None
+    if FLOW_METHOD == "RAFT":
+        scene_flow_tensor = calculate_flow_batched(
+            leaf_frames, raft_model, raft_transforms, device,
+            scene_index=0, batch_size=4  # Tune this (4, 2, or 1)
+        )
+    elif FLOW_METHOD == "FARNEBACK":
+        scene_flow_tensor = calculate_flow_farneback(
+            leaf_frames, scene_index=0
+        )
 
     if scene_flow_tensor is None or processing_interrupted:
         return None, None
@@ -780,11 +837,19 @@ def main(video_path, d_min=2.0, threshold_tau=100.0):
     print("SBD → Tree Splitting → RAFT on Leaf Nodes → ResNet Embeddings")
     print("="*60)
 
-    # Load both models at once (we'll need both for each leaf node)
-    print("\n[INFO] Loading RAFT and ResNet models...")
-    raft_weights, raft_model = load_raft(SMALL_RAFT, device)
-    raft_transforms = raft_weights.transforms()
-    raft_model.eval()
+    # Load the ResNet model (we always need this)
+    print("[INFO] Loading ResNet embedding model...")
+    resnet_model, resnet_transforms = load_embedding_model(device)
+
+    # Conditionally load the RAFT model ONLY if we selected it
+    raft_model, raft_transforms = None, None
+    if FLOW_METHOD == "RAFT":
+        print("[INFO] Loading RAFT model...")
+        raft_weights, raft_model = load_raft(SMALL_RAFT, device)
+        raft_transforms = raft_weights.transforms()
+        raft_model.eval()
+    else:
+        print(f"[INFO] Using {FLOW_METHOD} (CPU) for optical flow. RAFT model will not be loaded.")
     
     resnet_model, resnet_transforms = load_embedding_model(device)
     
@@ -833,8 +898,8 @@ def main(video_path, d_min=2.0, threshold_tau=100.0):
         _collect_leaf_nodes(tree_root, leaf_nodes)
         print(f"[STEP 2] Found {len(leaf_nodes)} leaf nodes to process")
         
-        # STEP 3: Process each leaf node with RAFT + ResNet
-        print(f"\n[STEP 3] Processing leaf nodes with RAFT + ResNet...")
+        # STEP 3: Process each leaf node with RAFT/ + ResNet
+        print(f"\n[STEP 3] Processing leaf nodes with Optical Flow + ResNet...")
         
         for j, leaf in enumerate(leaf_nodes):
             leaf_frames = leaf.end_frame - leaf.start_frame
@@ -902,7 +967,9 @@ def main(video_path, d_min=2.0, threshold_tau=100.0):
         print(f"\n[SCENE {i+1} SUMMARY] {len(leaf_nodes)} leaves: {complex_count} complex, {simple_count} simple")
 
     # Cleanup models
-    del raft_model, raft_weights, raft_transforms, resnet_model, resnet_transforms
+    del resnet_model, resnet_transforms
+    if FLOW_METHOD == "RAFT":
+        del raft_model, raft_weights, raft_transforms
     torch.cuda.empty_cache()
 
     # --- FINAL REPORTING ---
