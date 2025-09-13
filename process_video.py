@@ -127,6 +127,9 @@ def calculate_flow_farneback(leaf_frames, scene_index=0):
         # Set the current frame as the "previous" frame for the next iteration
         prev_gray = curr_gray
 
+        if i%5 :
+            print(f"    -> Progress: {i}/{num_pairs} pairs")
+
     if not all_flow_tensors:
         return None
         
@@ -832,14 +835,32 @@ def main(video_path, d_min=2.0, threshold_tau=100.0):
     # Save scene clips to disk (this is a fast copy operation)
     save_scenes_to_files(video_path, scene_list, clips_dir)
 
-    print("\n" + "="*60)
-    print("OP-HTD PIPELINE: CORRECT ORDER")
-    print("SBD → Tree Splitting → RAFT on Leaf Nodes → ResNet Embeddings")
-    print("="*60)
 
-    # Load the ResNet model (we always need this)
-    print("[INFO] Loading ResNet embedding model...")
-    resnet_model, resnet_transforms = load_embedding_model(device)
+    # --- Step 2: Pre-cache all scene frames into CPU RAM ---
+    print("\n[INFO] Pre-caching all scene frames into CPU RAM...")
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"[ERROR] Could not open video file: {video_path}")
+        return
+    
+    all_scene_frames_data = []
+    for i, (start_time, end_time) in enumerate(scene_list):
+        start_frame = start_time.get_frames()
+        end_frame = end_time.get_frames()
+
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        scene_frames = []
+        for frame_num in range(start_frame, end_frame):
+            ret, frame = cap.read()
+            if not ret:
+                break
+            scene_frames.append({'frame_number': frame_num, 'frame_data': frame})
+        all_scene_frames_data.append(scene_frames)
+    cap.release()
+    print("[INFO] Frame caching complete.")
+
+    # --- STAGE 1: Optical Flow (RAFT-only) ---
+    print("\n--- STAGE 1: Calculating Optical Flow (RAFT Model Loaded) ---")
 
     # Conditionally load the RAFT model ONLY if we selected it
     raft_model, raft_transforms = None, None
@@ -851,6 +872,39 @@ def main(video_path, d_min=2.0, threshold_tau=100.0):
     else:
         print(f"[INFO] Using {FLOW_METHOD} (CPU) for optical flow. RAFT model will not be loaded.")
     
+    
+    all_flow_tensors_cpu = []
+    
+    for i, scene_frames in enumerate(all_scene_frames_data):
+        print(f"\n[INFO] Processing Scene {i+1} (RAFT step)")
+        
+        scene_flow_tensor = None
+        if FLOW_METHOD == "RAFT":
+            scene_flow_tensor = calculate_flow_batched(
+                scene_frames, raft_model, raft_transforms, device,
+                scene_index=i, batch_size=1  # Tune this (4, 2, or 1)
+            )
+        elif FLOW_METHOD == "FARNEBACK":
+            scene_flow_tensor = calculate_flow_farneback(
+                scene_frames, scene_index=i
+            )
+
+        if scene_flow_tensor is not None:
+            all_flow_tensors_cpu.append(scene_flow_tensor)
+        else:
+            print(f"  -> Scene {i+1} had no frame pairs, skipping.")
+            all_flow_tensors_cpu.append(None)
+
+    print("\n--- STAGE 1 COMPLETE ---")
+
+    # --- STAGE 2: Unload RAFT from GPU ---
+    print("[INFO] Unloading RAFT model from VRAM...")
+    if FLOW_METHOD == "RAFT":
+        del raft_weights, raft_model, raft_transforms
+    torch.cuda.empty_cache()
+
+       # --- STAGE 3: Embedding & Tree Building (ResNet-only) ---
+    print("\n--- STAGE 2: Calculating Embeddings and Building Trees (ResNet Model Loaded) ---")
     resnet_model, resnet_transforms = load_embedding_model(device)
     
     # Store all results
@@ -858,8 +912,7 @@ def main(video_path, d_min=2.0, threshold_tau=100.0):
     all_variance_results = []
     all_complex_nodes = []
     
-    # Process each scene with correct OP-HTD pipeline
-    for i, (start_time, end_time) in enumerate(scene_list):
+    for i, scene_flow_tensor in enumerate(all_flow_tensors_cpu):
         if processing_interrupted:
             print(f"\n[INFO] Processing interrupted. Stopping at scene {i+1}")
             break
@@ -867,110 +920,43 @@ def main(video_path, d_min=2.0, threshold_tau=100.0):
         print(f"\n{'='*40}")
         print(f"PROCESSING SCENE {i+1}/{len(scene_list)}")
         print(f"{'='*40}")
+        
+        if scene_flow_tensor is not None:
+            # Get embeddings
+            scene_embeddings = get_embeddings_from_flow(scene_flow_tensor, resnet_model, resnet_transforms, device)
+            print(f"  -> Got embedding set of shape: {scene_embeddings.shape}")
 
-        scene_start_frame = start_time.get_frames()
-        scene_end_frame = end_time.get_frames()
-        total_frames = scene_end_frame - scene_start_frame
-
-        print(f"[INFO] Scene {i+1}: {total_frames} frames ({total_frames/fps:.2f}s)")
-
-        # Check memory before processing each scene
-        if i > 0:  # Skip first scene
-            print(f"[INFO] Memory check before scene {i+1}:")
-            if check_memory_pressure():
-                print(f"[WARNING] High memory pressure before scene {i+1}. Consider stopping if this persists.")
-                time.sleep(2)  # Brief pause to allow cleanup
-        
-        # STEP 1: Build hierarchical tree structure (no processing yet)
-        print(f"\n[STEP 1] Building hierarchical tree structure...")
-        from _htd_tree import build_hierarchical_tree
-        
-        # Create dummy embeddings just for tree structure (we'll replace these)
-        dummy_embeddings = torch.zeros(max(1, total_frames-1), 2048)
-        
-        tree_root = build_hierarchical_tree(
-            scene_start_frame, scene_end_frame, dummy_embeddings,
-            fps, d_min_frames=int(d_min * fps), scene_id=i+1
-        )
-        
-        # STEP 2: Get all leaf nodes from the tree
-        leaf_nodes = []
-        _collect_leaf_nodes(tree_root, leaf_nodes)
-        print(f"[STEP 2] Found {len(leaf_nodes)} leaf nodes to process")
-        
-        # STEP 3: Process each leaf node with RAFT/ + ResNet
-        print(f"\n[STEP 3] Processing leaf nodes with Optical Flow + ResNet...")
-        
-        for j, leaf in enumerate(leaf_nodes):
-            leaf_frames = leaf.end_frame - leaf.start_frame
-            leaf_duration = leaf_frames / fps
-            print(f"  -> Leaf {j+1}/{len(leaf_nodes)}: {leaf.node_id} ({leaf_frames} frames, {leaf_duration:.2f}s)")
+            # Get scene timing information
+            start_time, end_time = scene_list[i]
+            scene_start_frame = start_time.get_frames()
+            scene_end_frame = end_time.get_frames()
             
-            # Process this leaf node
-            leaf_embeddings, _ = process_leaf_node_flows(
-                leaf, video_path, raft_model, raft_transforms,
-                resnet_model, resnet_transforms, device, fps
+            # Process scene with hierarchical tree
+            root_node, variance_results, complex_leaves = process_scene_with_tree(
+                scene_embeddings=scene_embeddings,
+                scene_start_frame=scene_start_frame,
+                scene_end_frame=scene_end_frame,
+                fps=fps,
+                scene_id=i+1,
+                d_min_frames=d_min * fps,
+                threshold_tau=threshold_tau
             )
+            
+            # Store results
+            all_scene_trees.append(root_node)
+            all_variance_results.append(variance_results)
+            all_complex_nodes.extend(complex_leaves)  # Flatten across all scenes
+            
+        else:
+            print(f"  -> Skipping scene {i+1} (no flow data).")
+            all_scene_trees.append(None)
+            all_variance_results.append({})
 
-            if processing_interrupted:
-                print(f"    -> Processing interrupted during leaf processing")
-                break
-
-            if leaf_embeddings is not None:
-                # Store embeddings in the leaf node
-                leaf.embeddings = leaf_embeddings
-                print(f"    -> Generated embeddings: {leaf_embeddings.shape}")
-
-                # Calculate variance for this leaf
-                if len(leaf_embeddings) > 1:
-                    covariance_matrix = torch.cov(leaf_embeddings.T)
-                    variance_score = torch.trace(covariance_matrix).item()
-                else:
-                    variance_score = 0.0
-
-                leaf.variance_score = variance_score
-                leaf.is_complex = variance_score > threshold_tau
-
-                complexity = "COMPLEX" if leaf.is_complex else "simple"
-                print(f"    -> Variance: {variance_score:.2f} ({complexity})")
-
-            else:
-                print(f"    -> Failed to process leaf node")
-                leaf.embeddings = torch.zeros(1, 2048)
-                leaf.variance_score = 0.0
-                leaf.is_complex = False
-
-            # Clear embeddings from memory after processing to save space
-            if hasattr(leaf, 'embeddings') and leaf.embeddings is not None:
-                # Keep only the variance score and complexity flag
-                del leaf.embeddings
-                if device == "cuda":
-                    torch.cuda.empty_cache()
-        
-        # STEP 4: Collect results
-        variance_results = {}
-        complex_leaves = []
-        
-        for leaf in leaf_nodes:
-            if leaf.variance_score is not None:
-                variance_results[leaf.node_id] = leaf.variance_score
-                if leaf.is_complex:
-                    complex_leaves.append(leaf)
-        
-        all_scene_trees.append(tree_root)
-        all_variance_results.append(variance_results)
-        all_complex_nodes.extend(complex_leaves)
-        
-        # Summary for this scene
-        complex_count = len(complex_leaves)
-        simple_count = len(leaf_nodes) - complex_count
-        print(f"\n[SCENE {i+1} SUMMARY] {len(leaf_nodes)} leaves: {complex_count} complex, {simple_count} simple")
-
-    # Cleanup models
+    print("\n--- STAGE 2 COMPLETE ---")
+    
+    # --- STAGE 4: Unload ResNet & Final Report ---
     del resnet_model, resnet_transforms
-    if FLOW_METHOD == "RAFT":
-        del raft_model, raft_weights, raft_transforms
-    torch.cuda.empty_cache()
+    torch.cuda.empty_cache
 
     # --- FINAL REPORTING ---
     print("\n" + "="*60)
