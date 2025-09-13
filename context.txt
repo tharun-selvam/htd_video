@@ -1,0 +1,68 @@
+OP-HTD Video Processing Implementation Summary
+
+  📝 What Was Built
+
+  A complete implementation of the OP-HTD (Optical flow-based Hierarchical Temporal Decomposition) method for efficient video indexing and semantic
+  analysis.
+
+  🔧 Core Components
+
+  Files:
+
+  - process_video.py - Main pipeline implementation
+  - _htd_tree.py - Hierarchical tree data structures and processing
+
+  Pipeline (Correct OP-HTD Order):
+
+  1. SBD (PySceneDetect) → Split video into scenes
+  2. Tree Splitting → Build binary trees per scene (down to d_min duration)  
+  3. RAFT on Leaf Nodes → Optical flow only on small segments (2-3s each)
+  4. ResNet Embeddings → Convert flow fields to 2048-dim vectors
+  5. Variance Analysis → Classify leaves as complex/simple based on embedding spread
+  6. Visualization → Create clips + t-SNE plots
+
+  ⚙️ Key Functions
+
+  Main Pipeline:
+  - main() - Orchestrates entire OP-HTD pipeline
+  - process_leaf_node_flows() - RAFT+ResNet processing per leaf
+  - find_scenes() - PySceneDetect SBD
+  - build_hierarchical_tree() - Creates binary tree structure
+
+  Processing:
+  - calculate_flow_batched() - RAFT optical flow with adaptive batching
+  - get_embeddings_from_flow() - ResNet-50 feature extraction
+  - calculate_leaf_variances() - Motion complexity scoring
+
+  Visualization:
+  - create_leaf_clips_structure() - Organized video clips by tree structure
+  - create_embedding_visualization() - t-SNE plots of embedding spreads
+
+  🎯 Key Parameters
+
+  VIDEO_PATH = "clips/med.mp4"
+  D_MIN_SECONDS = 3.0      # Minimum leaf duration
+  THRESHOLD_TAU = 100.0    # Complex/simple classification threshold
+
+  📊 Outputs
+
+  out_clips/
+  ├── scene_001/
+  │   ├── scene_1_root_L_L_frames_0-90_complex_V150.2.mp4
+  │   ├── scene_1_root_L_R_frames_90-180_simple_V45.1.mp4
+  │   └── ...
+  ├── scene_002/
+  ├── tsne_embedding_visualization.png
+  └── variance_distribution.png
+
+  🚀 Major Fix Applied
+
+  Problem: Original pipeline processed entire scenes (91 frames) with RAFT, causing OOM kills.
+  Solution: Restructured to process only leaf nodes (2-3 seconds each) with RAFT, following true OP-HTD methodology.
+
+  💡 Usage
+
+  python process_video.py
+
+  The implementation now correctly follows the OP-HTD paper: efficient sparse processing where only "complex" leaf segments need expensive VLM annotation,
+  achieving significant computational savings.
