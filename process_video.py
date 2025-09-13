@@ -18,15 +18,175 @@ from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 from torchvision.models.optical_flow import raft_small, Raft_Small_Weights
 from torchvision.utils import flow_to_image
 from _htd_tree import process_scene_with_tree
+from PIL import Image
+from llava.model.builder import load_pretrained_model
+from llava.mm_utils import tokenizer_image_token, process_images, get_model_name_from_path
+from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
+from llava.conversation import conv_templates
 
 # --- GLOBAL CONTROLLER: Choose your flow algorithm ---
 # Options: "RAFT" or "FARNEBACK"
-FLOW_METHOD = "RAFT"
+FLOW_METHOD = "FARNEBACK"
 SMALL_RAFT = 1
 BIG_RAFT = 2
 
 # Global variables for graceful shutdown
 processing_interrupted = False
+
+def load_vlm_model(model_path, device="cuda"):
+    """
+    Loads the FastVLM (LLaVA-based) model, tokenizer, and image processor.
+    This is based on the logic from the official predict.py.
+    """
+    print(f"\n[INFO] Loading VLM model from: {model_path}...")
+    
+    model_base = None 
+    model_name = get_model_name_from_path(model_path)
+    
+    try:
+        tokenizer, model, image_processor, context_len = load_pretrained_model(
+            model_path, 
+            model_base, 
+            model_name, 
+            device=device  # Use the script's device, not a hardcoded "mps"
+        )
+    except RuntimeError as e:
+        if "mps" in str(e):
+            print("\n[FATAL ERROR] Your PyTorch environment is not configured for your GPU.")
+            print("You are likely running the Apple-provided code on an NVIDIA GPU without fixing the hardcoded 'mps' device flags.")
+            print("Please fix the predict.py file in the llava library or your environment.\n")
+        raise e
+
+    model.eval()
+    print("[INFO] FastVLM loaded successfully.")
+    return model, tokenizer, image_processor
+
+
+def annotate_complex_nodes_with_vlm(complex_nodes, video_path, model, tokenizer, image_processor, device):
+    """
+    Generates textual descriptions for a list of complex leaf nodes using FastVLM.
+    It samples ONE representative frame (the middle frame) from each complex clip.
+    """
+    if not complex_nodes:
+        print("[INFO] No complex nodes to annotate.")
+        return
+
+    print(f"\n[INFO] Annotating {len(complex_nodes)} complex leaf nodes with VLM...")
+    
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"[ERROR] Could not open video file for VLM annotation: {video_path}")
+        return
+
+    for i, node in enumerate(complex_nodes):
+        global processing_interrupted
+        if processing_interrupted:
+            print("  -> VLM annotation interrupted.")
+            break
+
+        print(f"  -> Annotating node {i+1}/{len(complex_nodes)}: {node.node_id}")
+        
+        # --- 1. Sample the MIDDLE frame from the clip ---
+        middle_frame_idx = node.start_frame + (node.frame_count // 2)
+        
+        cap.set(cv2.CAP_PROP_POS_FRAMES, middle_frame_idx)
+        ret, frame = cap.read()
+        if not ret:
+            print(f"    -> Could not sample middle frame for node {node.node_id}. Skipping.")
+            continue
+            
+        # Convert frame from BGR (OpenCV) to RGB and then to PIL Image
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(frame_rgb)
+        image_size = pil_image.size
+
+        # --- 2. Process the Image (using FastVLM/LLaVA's processor) ---
+        image_tensor = process_images([pil_image], image_processor, model.config)[0]
+        image_tensor = image_tensor.unsqueeze(0).to(device, dtype=torch.float16)
+
+        # # --- 3. Build the VLM Prompt (using the required conversation template) ---
+        # prompt_text = "Describe the primary action in this scene in one detailed sentence."
+        
+        # # FastVLM uses the Qwen2 conv template ("qwen_2")
+        # conv = conv_templates["qwen_2"].copy()
+        
+        # prompt_with_tokens = DEFAULT_IMAGE_TOKEN + '\n' + prompt_text
+        # conv.append_message(conv.roles[0], prompt_with_tokens)
+        # conv.append_message(conv.roles[1], None)
+        # prompt_inputs = conv.get_prompt()
+
+        # # Tokenize the final prompt string
+        # input_ids = tokenizer_image_token(prompt_inputs, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).to(device)
+
+        # # --- 4. Generate Description with VLM ---
+        # try:
+        #     with torch.inference_mode():
+        #         output_ids = model.generate(
+        #             input_ids,
+        #             images=image_tensor,
+        #             image_sizes=[image_size],
+        #             do_sample=False,  # Set to False for deterministic descriptions
+        #             temperature=0.0,
+        #             max_new_tokens=150,
+        #             use_cache=True
+        #         )
+
+        #     description = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
+            
+        #     # --- 5. Store the Description directly in the Tree Node ---
+        #     node.vlm_labels = {"description": description}
+        #     print(f"    -> VLM Description: \"{description}\"")
+
+        # except Exception as e:
+        #     print(f"    -> [ERROR] Failed to generate VLM description for node {node.node_id}. Reason: {e}")
+        #     node.vlm_labels = {"description": "Error during generation."}
+        #     if "out of memory" in str(e).lower():
+        #         print("    -> CUDA Out of Memory. This can happen if VRAM is fragmented. Stopping VLM stage.")
+        #         torch.cuda.empty_cache()
+        #         break # Stop trying to annotate
+
+        # Construct prompt
+        prompt_text = "Describe the primary action in this scene in one detailed sentence."
+        qs = prompt_text
+        if model.config.mm_use_im_start_end:
+            qs = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + '\n' + qs
+        else:
+            qs = DEFAULT_IMAGE_TOKEN + '\n' + qs
+        conv = conv_templates["qwen_2"].copy()
+        conv.append_message(conv.roles[0], qs)
+        conv.append_message(conv.roles[1], None)
+        prompt = conv.get_prompt()
+
+        # Set the pad token id for generation
+        model.generation_config.pad_token_id = tokenizer.pad_token_id
+
+        # Tokenize prompt
+        input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).to(torch.device("cuda"))
+
+        # Run inference
+        with torch.inference_mode():
+            output_ids = model.generate(
+                input_ids,
+                images=image_tensor.unsqueeze(0).half(),
+                image_sizes=[image_size],
+                do_sample=True,
+                temperature=0.2,
+                top_p=None,
+                num_beams=1,
+                max_new_tokens=256,
+                use_cache=True)
+
+            outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
+
+            node.vlm_labels = {"description": outputs}
+            print(f"    -> VLM Description: \"{outputs}\"")
+        #     print(f"    -> VLM Description: \"{description}\"")
+
+    cap.release()
+    print("[INFO] VLM annotation complete.")
+
+
+
 
 def signal_handler(sig, frame):
     """Handle interruption signals gracefully"""
@@ -958,6 +1118,35 @@ def main(video_path, d_min=2.0, threshold_tau=100.0):
     del resnet_model, resnet_transforms
     torch.cuda.empty_cache
 
+    # --- STAGE 5: Sparse VLM Annotation ---
+    # This stage runs ONLY on the "complex" nodes after VRAM is cleared.
+    if all_complex_nodes and not processing_interrupted:
+        
+        # !!! IMPORTANT !!! 
+        # UPDATE THIS PATH to your downloaded 1.5B model directory
+        VLM_MODEL_PATH = "model/llava-fastvithd_1.5b_stage3" 
+        
+       
+        # Load the VLM model now that other models are unloaded
+        vlm_model, vlm_tokenizer, vlm_image_processor = load_vlm_model(VLM_MODEL_PATH, device)
+        
+        annotate_complex_nodes_with_vlm(
+            all_complex_nodes, video_path, 
+            vlm_model, vlm_tokenizer, vlm_image_processor, 
+            device
+        )
+        
+        # Unload the VLM model to free memory before visualization
+        print("[INFO] Unloading VLM model...")
+        del vlm_model, vlm_tokenizer, vlm_image_processor
+        torch.cuda.empty_cache()
+        
+
+    elif not all_complex_nodes:
+        print("\n[INFO] No complex nodes found. Skipping VLM annotation stage.")
+    else:
+        print("\n[INFO] Processing was interrupted. Skipping VLM annotation stage.")
+
     # --- FINAL REPORTING ---
     print("\n" + "="*60)
     print("OP-HTD PIPELINE COMPLETE - SUMMARY")
@@ -1029,8 +1218,8 @@ def main(video_path, d_min=2.0, threshold_tau=100.0):
 
 if __name__ == "__main__":
     # --- CHANGE THESE PARAMETERS ---
-    VIDEO_PATH = "clips/med.mp4" 
+    VIDEO_PATH = "clips/small.mp4" 
     D_MIN_SECONDS = 3.0    # Minimum leaf duration in seconds (will be converted to frames)
-    THRESHOLD_TAU = 100.0  # Variance threshold for complex/simple classification
+    THRESHOLD_TAU = 55.0  # Variance threshold for complex/simple classification
     
     main(VIDEO_PATH, D_MIN_SECONDS, threshold_tau=THRESHOLD_TAU)
